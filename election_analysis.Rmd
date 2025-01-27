@@ -1,0 +1,683 @@
+---
+title: "The impact of recent migration on the 2024 national election in Vienna"
+author: "Hannes Essfors"
+output: html_document
+---
+
+```r
+knitr::opts_chunk$set(warning = FALSE, error = FALSE)
+```
+
+```{r setup, include=TRUE, echo = TRUE, message = FALSE, warning = FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(DescTools)
+library(sf)
+library(tmap)
+library(corrplot)
+library(data.table)
+library(purrr)
+library(car)
+library(Metrics)
+library(rsq)
+library(jtools)
+library(gt)
+```
+
+# Introduction
+The aim of this analysis is to study the impact of recent migration to Vienna on the election results of the national election in 2024.
+
+The analysis is carried out on a district level, studying the average yearly migration to each district and correlating it with percentage of votes for each party in the districts of Vienna.
+
+The types of migration studied are:
+* Net external migration (ext_net): net migration to Vienna from abroad
+* Net internal migration (int_net): net migration to Vienna from Austria
+* Net local migration (local_net): net migration between Viennese districts
+* internal local migration (local_internal): total migration within Viennese districts
+
+The source data is given in total numbers of persons migration, which for the sake of comparisons is recalculated as percentage of population living in a district.
+
+For the analysis, a linear regression model is implemented for each party, with the election results for the given party as target variable.
+
+The analysis is complemented with the sociodemographic variables of average age, percentage of females and income for each district for 2023 to control for their influence on voting pattern. 
+
+# Data import
+We start by importing the necessary data for the analysis. The election results have been sourced from https://www.wien.gv.at/wahlergebnis/de/NR241/index.html, the yearly migration from 2007 to 2023 per district with population and ge data has been cleaned in previous analysis and is accessed through the output_data folder. The social demographic indicators are sourced from https://www.data.gv.at/katalog/dataset/9ecf5866-dbe8-4cb2-b156-5097c7eec01f
+
+```{r data import, include = FALSE}
+election = read_delim(
+  "data/wahl_20241003_214746.csv",
+  delim = ";",
+  escape_double = FALSE,
+  trim_ws = TRUE
+)
+
+df = read_csv("output_data/clean_mig_pop.csv")
+
+geo_bezirk = st_read("output_data/geo_bez.geojson")
+
+geo_zählbezirk = st_read("output_data/geo_zbez.geojson")
+
+age = read_delim(
+  "data/vie-bez-biz-pop-age-2002f.csv",
+  delim = ";",
+  escape_double = FALSE,
+  trim_ws = TRUE
+)
+
+income = read_delim(
+  "data/vie-bez-biz-ecn-inc-sex-2002f.csv",
+  delim = ";",
+  escape_double = FALSE,
+  trim_ws = TRUE
+)
+
+sex = read_delim(
+  "data/vie-bez-pop-sex-stk-1869f.csv",
+  delim = ";",
+  escape_double = FALSE,
+  trim_ws = TRUE
+)
+
+
+```
+
+## Election data
+We tidy up the election by removing non relevant columns and rows, renaming columns and turning the number of votes into a percentage of votes for each party.
+
+```{r election data, include = TRUE}
+
+head(election)
+
+election = election %>% filter(substr(NUTS, 1, 2) == "G9" &
+                                 Wahlberechtigte > 0 &
+                                 substr(NUTS, 5, 6) == "00")
+election = election[9:nrow(election),]
+election$bezirk = 1:23
+election = subset(
+  election,
+  select = -c(
+    NUTS,
+    Gebietsname,
+    Wahlberechtigte,
+    Abgegebene,
+    `Ung?ltige`,
+    `G?ltige`,
+    ...19,
+    BGE
+  )
+)
+
+colnames(election) = c(
+  "ÖVP",
+  "SPÖ",
+  "FPÖ",
+  "GRÜNE",
+  "NEOS",
+  'BIER',
+  "MFG",
+  "LMP",
+  "GAZA",
+  "KPÖ",
+  "KEINE",
+  "bezirk"
+)
+
+election$bezirk = as.factor(election$bezirk)
+
+# turn election results into percentage
+perc = function(vec) {
+  vec = vec / sum(vec)
+}
+
+election = apply(election %>% select(!bezirk),
+                 FUN = perc,
+                 MARGIN = 1)
+
+election = t(as.data.frame(election))
+election = election * 100 
+rownames(election) = 1:nrow(election)
+election = as.data.frame(election)
+election$bezirk = as.factor(1:nrow(election))
+parliament = c("SPÖ", "ÖVP", "FPÖ", "GRÜNE", "NEOS")
+election = election[,c(parliament, "bezirk")]
+
+
+```
+
+## District data
+
+The subdistricts are first summed up into district (Bezirk) results and then averaged over time. The dataframe is then split into two, one for austrian migration and one for foreign migration. Columns indicating net migration are kept. 
+
+```{r District data, include = TRUE}
+
+#transforming yearly migration to percentage of current population of that year
+
+year_bezirk_sex_nat = df %>% group_by(year, bezirk, sex, nationality) %>%
+  summarize(
+    net = sum(net),
+    ext_net = sum(ext_net),
+    int_net = sum(int_net),
+    local_net = sum(local_net),
+    local_internal = sum(local_internal),
+    net_p = sum(net_p),
+    ext_net_p = sum(ext_net_p),
+    int_net_p = sum(int_net_p),
+    local_net_p = sum(local_net_p),
+    local_internal_p = sum(local_internal_p)
+  )
+
+
+#average yearly net migration from 2007 to 2023 per nationality
+bezirk_nat = year_bezirk_sex_nat %>% group_by(bezirk, nationality) %>%
+  summarize(
+    net_p = mean(net_p),
+    ext_net_p = mean(ext_net_p),
+    int_net_p = mean(int_net_p),
+    local_net_p = mean(local_net_p),
+    local_internal_p = mean(local_internal_p)
+  )
+
+bezirk_nat$bezirk = as.factor(bezirk_nat$bezirk)
+
+
+bezirk_election = bezirk_nat %>% inner_join(election, by = c("bezirk" = "bezirk"))
+
+
+tot_mig = as.data.frame(bezirk_election) %>% group_by(bezirk) %>% summarize(
+  net_p = sum(net_p),
+  ext_net_p = sum(ext_net_p),
+  int_net_p = sum(int_net_p),
+  local_net_p = sum(local_net_p),
+  local_internal_p = sum(local_internal_p)
+)
+
+tot_mig = as.data.frame(tot_mig) %>%
+  inner_join(election, by = c("bezirk" = "bezirk"))
+
+aut_mig = as.data.frame(bezirk_election) %>% filter(nationality == "Austrian")
+for_mig = as.data.frame(bezirk_election) %>% filter(nationality == "Foreign")
+```
+
+## Inspection of the data
+
+
+```{r inspect data}
+head(tot_mig)
+head(aut_mig)
+head(for_mig)
+```
+
+# Correlation analysis
+
+As an example for correlations, we use the perhaps most interesting example in our context, migration vs the right populist anti-migration party FPÖ.
+```{r FPÖ vs Austrian migration}
+cor(x = aut_mig$net_p,
+         y = aut_mig$FPÖ)
+
+mdl_1 = lm(data = aut_mig, FPÖ ~ net_p)
+plot(x = aut_mig$net_p, y = aut_mig$FPÖ, ylab = "FPÖ election results (%)", xlab = "net migration of Austrian citizens (%)", main = "Net migration of Austrians vs FPÖ election results per bezirk") + 
+  abline(a = mdl_1$coefficients[1], b = mdl_1$coefficients[2])
+
+
+cor(for_mig$net_p, for_mig$FPÖ)
+mdl_2 = lm(data = for_mig, FPÖ ~ net_p)
+plot(x = for_mig$net_p, y = for_mig$FPÖ, ylab = "FPÖ election results (%)", xlab = "net migration of foreign citizens (%)", main = "Net migration of foreign citizens vs FPÖ election results per bezirk") + 
+  abline(a = mdl_2$coefficients[1], b = mdl_2$coefficients[2])
+
+```
+As can be seen, there is a very strong negative correlation between migration and FPÖ election results. Bezirks that have received relatively large amounts of migration, foreign and Austrian, tends to note vote for the FPÖ. Districts with relatively smaller amounts of migration instead have a strong tendency to vote for FPÖ. Viewing only the Austrian migration, the tendency is stronger (r = -0.88, p < 0.001); districts with a negative net migration of austrians strongly tend to vote FPÖ. 
+
+## Correlation plot
+``` {r heatmap}
+cors_tot = as.data.frame(tot_mig) %>% select(!c(bezirk))
+cm = cor(cors_tot)
+corrplot(cm, title = "total migration")
+
+
+cors_aut = as.data.frame(aut_mig) %>% select(!c(bezirk, nationality))
+cm = cor(cors_aut)
+corrplot(cm, title = "Austrian citizens")
+
+
+cors_for = as.data.frame(for_mig) %>% select(!c(bezirk, nationality))
+cm = cor(cors_for)
+corrplot(cm, title = "foreign citizens")
+```
+
+From the correlation plots, it can be seen that the migration variables are somewhat intercorrelated, and show correlation with FPÖ, GRÜNE and to some extent NEOS. ÖVP and SPÖ on the other hand show no correlation with different types, but they are inversely correlated with each other. 
+
+
+```{r correlation function}
+
+get_correlations = function(data, covar, parties) {
+  #takes a dataframe with data of party election results and a correlated variable, and returns a dataframe
+  #with the correlation coefficient between the correlated variable and the election result of each party
+  #with a 95% CI
+  r = c()
+  upper_ci = c()
+  lower_ci = c()
+  covar = data[, covar]
+  for (party in parties) {
+    part_results = data[, party]
+    correlation = cor.test(covar, part_results)
+    r = c(r, correlation$estimate)
+    upper_ci = c(upper_ci, correlation$conf.int[1])
+    lower_ci = c(lower_ci, correlation$conf.int[2])
+  }
+  df_out = data.frame(parties, r, upper_ci, lower_ci)
+  return(df_out)
+}
+```
+
+## Correlation coefficients
+To get a better look at the relationship, the correlation coefficients are calculated for the different variables and plotted as barcharts with 95% confident intervalls.
+
+### Net migration
+```{r net migration with the outisde of Vienna}
+
+corrs_tot = get_correlations(tot_mig, "net_p", parliament)
+
+ggplot(data = corrs_tot, aes (y = r, x = parties, fill = parties)) +
+  geom_bar(stat = 'identity', fill = c("red", "black", "blue", "green", "pink")) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.1) +
+  labs(title = "Corrrelation coefficients with 95% CI for voting patterns and migration (average yearly percent)", y = "Pearson's r")
+corrs_aut = get_correlations(aut_mig, "net_p", parliament)
+
+ggplot(data = corrs_aut, aes (y = r, x = parties, fill = parties)) +
+  geom_bar(stat = 'identity', fill = c("red", "black", "blue", "green", "pink")) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.1) +
+  labs(title = "Corrrelation coefficients with 95% CI for voting patterns and austrian migration to Vienna (average yearly percent)", y = "Pearson's r")
+
+corrs_for = get_correlations(for_mig, "net_p", parliament)
+
+ggplot(data = corrs_for, aes (y = r, x = parties, fill = parties)) +
+  geom_bar(stat = 'identity', fill = c("red", "black", "blue", "green", "pink")) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.1) +
+  labs(title = "Corrrelation coefficients with 95% CI for voting patterns and foreign migration (average yearly percent)", y = "Pearson's r")
+
+```
+As can be seen, districts with large amounts of migration relative to their population tends to vote for the green and NEOS, and not vote for FPÖ, for SPÖ and ÖVP no relation is found. The relationship is the strongest for austrian migration. 
+
+
+### Within Vienna
+
+```{r net local migration}
+corrs_aut = get_correlations(aut_mig, "local_net_p", parliament)
+
+ggplot(data = corrs_aut, aes (y = r, x = parties, fill = parties)) +
+  geom_bar(stat = 'identity', fill = c("red", "black", "blue", "green", "pink")) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.1) +
+  labs(title = "Corrrelation coefficients with 95% CI 2024 election results and austrian migration within Vienna (average yearly percent)", y = "Pearson's r")
+
+corrs_for = get_correlations(for_mig, "local_net_p", parliament)
+
+ggplot(data = corrs_for, aes (y = r, x = parties, fill = parties)) +
+  geom_bar(stat = 'identity', fill = c("red", "black", "blue", "green", "pink")) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.1) +
+  labs(title = "Corrrelation coefficients with 95% CI for voting patterns and foreign migration (average yearly percent)", y = "Pearson's r")
+
+corrs_tot = get_correlations(tot_mig, "local_net_p", parliament)
+ggplot(data = corrs_tot, aes (y = r, x = parties, fill = parties)) +
+  geom_bar(stat = 'identity', fill = c("red", "black", "blue", "green", "pink")) +
+  geom_errorbar(aes(ymin = lower_ci, ymax = upper_ci), width = 0.1) +
+  labs(title = "Corrrelation coefficients with 95% CI for voting patterns and migration (average yearly net number of migrants", y = "Pearson's r")
+
+```
+Looking at the within Vienna migration, the relationship is the opposite: districts with larger amount of migration tend to vote FPÖ and not GRÜNE and NEOS and again, there seems to be no relationship between migration and ÖVP and SPÖ.
+
+
+# Modelling
+
+As the independent variables are intercorrelated, it is necessary to build a larger model to view them together, and also to add sociodemographic factors to control for and isolate the impact of migration.
+
+## Add Sociedemographics
+```{r add variables}
+
+## add socioeconomic indicator
+
+#average income 2021 https://www.data.gv.at/katalog/dataset/d76c0e8b-c599-4700-8a88-29d0d87e563d
+
+income = income %>%
+  filter(REF_YEAR == 2021) %>%
+  select(DISTRICT_CODE, INC_TOT_VALUE)
+colnames(income) = c("bezirk", "income")
+income = income[2:23, ]
+income$bezirk = as.factor(as.numeric(substr(income$bezirk, 2, 3)))
+
+
+## add demographic indicators https://www.data.gv.at/katalog/dataset/9ecf5866-dbe8-4cb2-b156-5097c7eec01f
+
+age = age %>% filter(REF_YEAR == 2024) %>% select(DISTRICT_CODE, AGE_AVE)
+colnames(age) = c("bezirk", "age")
+age = age[2:23, ]
+age$age = age$age / 100
+age$bezirk = as.factor(as.numeric(substr(age$bezirk, 2, 3)))
+
+
+
+sex = sex %>% filter(REF_YEAR == 2024) %>% mutate(perc_fem = POP_FEM / POP_TOTAL * 100) %>% select(DISTRICT_CODE, perc_fem)
+colnames(sex) = c("bezirk", "perc_fem")
+sex$bezirk = as.factor(as.numeric(substr(sex$bezirk, 2, 3)))
+
+```
+
+
+
+## join dataframes to create model
+
+```{r join dfs}
+aut_mig_var = as.data.frame(aut_mig) %>%
+  select(bezirk, net_p, local_net_p, local_internal_p) %>%
+  rename_with( ~ paste0(., "_aut"), c(net_p, local_net_p, local_internal_p))
+
+for_mig_var = as.data.frame(for_mig) %>%
+  select(bezirk, net_p, local_net_p, local_internal_p) %>%
+  rename_with( ~ paste0(., "_for"), c(net_p, local_net_p, local_internal_p))
+
+list_df = list(age, sex, income, aut_mig_var, for_mig_var, election[c(parliament, "bezirk")])
+
+mdl_df = reduce(list_df, ~ inner_join(.x, .y, by = "bezirk"))
+
+mdl_df = as.data.frame(mdl_df %>% select(!bezirk))
+
+```
+
+
+## correlation plots
+```{r corrplots}
+cm = cor(mdl_df)
+corrplot(cm, method = "pie")
+
+```
+The demographic variables are intercorrelated, the migration variables as well, with within district migration of foreigners being correlated with demographic factors as well as ÖVP and SPÖ. ÖVP and SPÖ are correlated with demographic factors while FPÖ, GRÜNE and NEOS are correlated with migration variables. 
+
+
+## FPÖ
+
+```{r FPÖ}
+
+df_mdl_FPÖ = subset(mdl_df, select = -c(SPÖ, ÖVP, GRÜNE, NEOS))
+
+mdl_FPÖ = lm(data = df_mdl_FPÖ, FPÖ  ~ .)
+summary(mdl_FPÖ)
+rsq(mdl_FPÖ)
+AIC(mdl_FPÖ)
+RMSE(mdl_FPÖ)
+vif(mdl_FPÖ) 
+res = resid(mdl_FPÖ)
+qqnorm(res)
+qqline(res) # normally distributed residuals
+
+mdl_FPÖ_scale = lm(data = as.data.frame(apply(
+  df_mdl_FPÖ, MARGIN = 2, FUN = scale
+)), FPÖ  ~ .)
+summary(mdl_FPÖ_scale)
+
+df_mdl_FPÖ_2 = subset(df_mdl_FPÖ,
+                      select = -c(local_net_p_aut, age, local_internal_p_for))
+
+mdl_FPÖ_2 = lm(data = df_mdl_FPÖ_2, FPÖ ~ .)
+summary(mdl_FPÖ_2)
+rsq(mdl_FPÖ_2) 
+RMSE(mdl_FPÖ_2) 
+AIC(mdl_FPÖ_2) 
+vif(mdl_FPÖ_2)
+res = resid(mdl_FPÖ_2)
+qqnorm(res)
+qqline(res)
+shapiro.test(res) #no significant support for deviation from normality
+
+mdl_FPÖ_2_scale = lm(data = as.data.frame(apply(
+  df_mdl_FPÖ_2, MARGIN = 2, FUN = scale
+)), FPÖ  ~ .)
+summary(mdl_FPÖ_2_scale)
+plot_coefs(mdl_FPÖ_2_scale, colors = "darkblue") + theme_apa() + ggtitle("Beta coefficients for linear regression model, FPÖ results as dependent variable")
+
+best_mdl_FPÖ = mdl_FPÖ_2
+best_mdl_FPÖ_scale = mdl_FPÖ_2_scale
+
+```
+When accounting for other factors such as income and gender, migration remains significant predictors of FPÖ election results. Specifically, an increase in Austrian migration is associated with worse results for FPÖ, and an increase in foreign migration both within and from outside Vienna is associated with increased support for FPÖ. The most important variable for FPÖ support is given by looking at which district most foreign citizens already living in Vienna are moving to. 
+
+
+## GRÜNE
+
+``` {r GRUENE}
+df_mdl_GRN = subset(mdl_df, select = -c(SPÖ, ÖVP, FPÖ, NEOS))
+
+mdl_GRN = lm(data = df_mdl_GRN, GRÜNE ~ .)
+summary(mdl_GRN)
+rsq(mdl_GRN) 
+AIC(mdl_GRN) 
+RMSE(mdl_GRN)
+vif(mdl_GRN)
+res = resid(mdl_GRN)
+qqnorm(res)
+qqline(res)
+shapiro.test(res) # no support for deviation from normality
+
+df_mdl_GRN_2 = subset(
+  df_mdl_GRN,
+  select = -c(
+    local_internal_p_aut,
+    local_internal_p_for,
+    local_net_p_aut,
+    age
+  )
+)
+
+mdl_GRN_2 = lm(data = df_mdl_GRN_2, GRÜNE ~ .)
+summary(mdl_GRN_2)
+rsq(mdl_GRN_2)
+AIC(mdl_GRN_2) 
+RMSE(mdl_GRN) 
+vif(mdl_GRN_2) 
+res = resid(mdl_GRN_2)
+qqnorm(res)
+qqline(res)
+shapiro.test(res)
+
+mdl_GRN_2_scale = lm(data = as.data.frame(scale(df_mdl_GRN_2)), GRÜNE ~ .)
+summary(mdl_GRN_2_scale)
+
+plot_coefs(mdl_GRN_2_scale, colors = "green") + theme_apa() + ggtitle("Beta coefficients for linear regression model, GRÜNE results as dependent variable")
+
+best_mdl_GRN = mdl_GRN_2
+best_mdl_GRN_scale = mdl_GRN_2_scale
+
+```
+The model of GRÜNE results is a somewhat better fit than the one for FPÖ, reveealing an inverse of the relationship between migration and election results as observed for FPÖ.
+
+A difference observed is that income has a significant effect on the support for GRÜNE, where higher income is associated with lower support. The effect is however small.
+
+## ÖVP
+
+```{r ÖVP}
+df_mdl_ÖVP = subset(mdl_df, select = -c(SPÖ, GRÜNE, FPÖ, NEOS))
+
+mdl_ÖVP = lm(data = df_mdl_ÖVP, ÖVP ~ .)
+summary(mdl_ÖVP)
+rsq(mdl_ÖVP) 
+AIC(mdl_ÖVP) 
+RMSE(mdl_ÖVP) 
+vif(mdl_ÖVP) 
+res = resid(mdl_ÖVP)
+qqnorm(res)
+qqline(res)
+shapiro.test(res) # no support for deviation from normality
+
+
+df_mdl_ÖVP_2 = subset(
+  df_mdl_ÖVP,
+  select = -c(
+    income,
+    local_internal_p_aut,
+    local_internal_p_aut,
+    local_internal_p_for,
+    local_net_p_aut
+  )
+)
+
+mdl_ÖVP_2 = lm(data = df_mdl_ÖVP_2, ÖVP ~ .)
+summary(mdl_ÖVP_2)
+rsq(mdl_ÖVP_2) 
+AIC(mdl_ÖVP_2) 
+RMSE(mdl_ÖVP_2) 
+vif(mdl_ÖVP_2) 
+res = resid(mdl_ÖVP_2)
+qqnorm(res)
+qqline(res)
+shapiro.test(res) # no support for deviation from normality
+
+mdl_ÖVP_2_scale = lm(data = as.data.frame(scale(df_mdl_ÖVP_2)), ÖVP ~ .)
+summary(mdl_ÖVP_2_scale)
+
+plot_coefs(mdl_ÖVP_2_scale, colors = "black") + theme_apa() + ggtitle("Beta coefficients for linear regression model, ÖVP results as dependent variable")
+
+best_mdl_ÖVP = mdl_ÖVP_2
+best_mdl_ÖVP_scale = mdl_ÖVP_2_scale
+```
+best_mdl_ÖVP_scale = mdl_ÖVP_2
+The model of ÖVP has a good fit and is similar to that of FPÖ with regard to migration: Increased Austrian migration is associated with lower support for ÖVP, increased foreign migration is associated with increased support for ÖVP, the size of the effect is however smaller. In the case of ÖVP, age and gender are significant variables, where the older the average population and the larger the percent of female residents, the more support for ÖVP.
+
+## SPÖ
+
+```{r SPÖ}
+df_mdl_SPÖ = subset(mdl_df, select = -c(ÖVP, GRÜNE, FPÖ, NEOS))
+
+mdl_SPÖ = lm(data = df_mdl_SPÖ, SPÖ ~ .)
+summary(mdl_SPÖ)
+rsq(mdl_SPÖ) 
+AIC(mdl_SPÖ) 
+RMSE(mdl_SPÖ) 
+vif(mdl_SPÖ) 
+res = resid(mdl_SPÖ)
+qqnorm(res)
+qqline(res)
+shapiro.test(res) # no support for deviation from normality
+
+
+df_mdl_SPÖ_2 = subset(df_mdl_SPÖ,
+                      select = -c(income, local_net_p_for, local_internal_p_for))
+
+mdl_SPÖ_2 = lm(data = df_mdl_SPÖ_2, SPÖ ~ .)
+summary(mdl_SPÖ_2)
+rsq(mdl_SPÖ_2) 
+AIC(mdl_SPÖ_2)
+RMSE(mdl_SPÖ_2) 
+vif(mdl_SPÖ_2) # no VIF > 10
+res = resid(mdl_SPÖ_2)
+qqnorm(res)
+qqline(res)
+shapiro.test(res) # no support for deviation from normality
+
+mdl_SPÖ_2_scale = lm(data = as.data.frame(scale(df_mdl_SPÖ_2)), SPÖ ~ .)
+summary(mdl_SPÖ_2_scale)
+
+plot_coefs(mdl_SPÖ_2_scale, colors = "red") + theme_apa() + ggtitle("Beta coefficients for linear regression model, SPÖ results as dependent variable")
+
+best_mdl_SPÖ = mdl_SPÖ_2
+best_mdl_SPÖ_scale = mdl_SPÖ_2_scale
+
+```
+For SPÖ, no significant association between migration and party support is found when accounting for other demographic indicators. Instead, an increase in age and percentage of females is associated with lower support for SPÖ.
+
+## NEOS
+
+```{r NEOS}
+
+df_mdl_NEOS = subset(mdl_df, select = -c(ÖVP, GRÜNE, FPÖ, SPÖ))
+
+mdl_NEOS = lm(data = df_mdl_NEOS, NEOS ~ .)
+summary(mdl_NEOS)
+rsq(mdl_NEOS) #0.96
+AIC(mdl_NEOS) #70
+RMSE(mdl_NEOS) #0.72
+vif(mdl_NEOS) #
+res = resid(mdl_NEOS)
+qqnorm(res)
+qqline(res)
+shapiro.test(res) # no support for deviation from normality
+
+
+df_mdl_NEOS_2 = subset(
+  df_mdl_NEOS,
+  select = -c(
+    age,
+    local_net_p_aut,
+    local_internal_p_aut,
+    local_internal_p_for
+  )
+)
+
+mdl_NEOS_2 = lm(data = df_mdl_NEOS_2, NEOS ~ .)
+summary(mdl_NEOS_2)
+rsq(mdl_NEOS_2) 
+AIC(mdl_NEOS_2) 
+RMSE(mdl_NEOS_2) 
+vif(mdl_NEOS_2) 
+res = resid(mdl_NEOS_2)
+qqnorm(res)
+qqline(res)
+shapiro.test(res) # no support for deviation from normality
+
+mdl_NEOS_2_scale = lm(data = as.data.frame(scale(df_mdl_NEOS_2)), NEOS ~ .)
+summary(mdl_NEOS_2_scale)
+
+plot_coefs(mdl_NEOS_2_scale, colors = "pink") + theme_apa() + ggtitle("Beta coefficients for linear regression model, NEOS results as dependent variable")
+
+best_mdl_NEOS = mdl_NEOS_2
+best_mdl_NEOS_scale = mdl_NEOS_2_scale
+```
+In the case of the NEOS, neither external nor internal migration has a significant effect, instead, gender and income and gender have the largest effect. An increase in percentage of female residents and increase in average income is associated with increased support for NEOS. An increase in foreign immigrants within Vienna is also associated with lower support for NEOS.
+
+##Summary
+``` {r summary plot}
+plot_summs(
+  best_mdl_FPÖ_scale,
+  best_mdl_GRN_scale,
+  best_mdl_ÖVP_scale,
+  best_mdl_SPÖ_scale,
+  best_mdl_NEOS_scale,
+  colors = c("blue", 'green', 'black', 'red', 'pink'),
+  model.names = c("FPÖ", 'GRÜNE', 'ÖVP', "SPÖ", 'NEOS')
+) +
+  theme_apa() + ggtitle("Comparison of beta coefficients for modelling party support in Vienna")
+
+```
+```{r summary table}
+
+metrics = data.frame(
+  Model = c("FPÖ", "GRÜNE", "ÖVP", "SPÖ", "NEOS"),
+  R2 = round(c(summary(best_mdl_FPÖ)$r.squared,
+         summary(best_mdl_GRN)$r.squared,
+         summary(best_mdl_ÖVP)$r.squared,
+         summary(best_mdl_SPÖ)$r.squared,
+         summary(best_mdl_NEOS)$r.squared),3),
+  AIC = round(c(AIC(best_mdl_FPÖ),
+          AIC(best_mdl_GRN),
+          AIC(best_mdl_ÖVP),
+          AIC(best_mdl_SPÖ),
+          AIC(best_mdl_NEOS)),3),
+  RMSE = round(c(RMSE(best_mdl_FPÖ),
+          RMSE(best_mdl_GRN),
+          RMSE(best_mdl_ÖVP),
+          RMSE(best_mdl_SPÖ),
+          RMSE(best_mdl_NEOS)),3)
+)
+
+gt(metrics)
+```
+
+# Conclusion
+
+All in all, several models could successfully be created explaining most of the variability in election results between the Viennese districts. The best model was the one of ÖVP, with an R2 of 0.966 and a Root mean squared error of 0.180. Across the board, recent migration is a significant predictor of election results for all parties except for SPÖ, whose results are explained by a combination of age and gender. 
+
+A more positive net migration of persons with foreign citizen ship is associated with a better result for ÖVP and FPÖ, while a more positive net migration of Austrians is associated with a worse result for ÖVP and FPÖ. In the case of ÖVP, the sociodemographic factors age and gender are significant predictors as well. In the case of ÖVP, age is the most important variable, but for FPÖ it is within Vienna migration of foreigners.
+
+The modell of the greens results tell a smiliar story, but their results are positively associated with net migration of austrians and negatively associated with migration of foreigners. Interestingly, income is here significant predictor with a negative direction, indicating that the greens enjoy support from voters with lower income, which could be due to e.g. Students preferring this party.
+
+Just like for the greens, the NEOS has income as a significant predictor, being associated with a larger income however. Here, the effect of income is even the largest and most important, while migration does not have a perticular impact. 

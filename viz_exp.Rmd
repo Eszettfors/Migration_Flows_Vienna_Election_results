@@ -1,0 +1,667 @@
+---
+title: "Doing Data Science Project, Visualization and Exploration"
+author: "Hannes Essfors"
+output: html_document
+---
+
+``` r
+knitr::opts_chunk$set(warning = FALSE, error = FALSE)
+```
+
+```{r setup, include=TRUE, echo = TRUE, message = FALSE, warning = FALSE}
+library(dplyr)
+library(tidyr)
+library(ggplot2)
+library(readr)
+library(DescTools)
+library(sf)
+library(tmap)
+library(patchwork)
+options(dplyr.summarise.inform = FALSE)
+```
+
+# Introduction
+
+This first analysis aims to give an introduction to the data that is worked with. The data will be imported, cleaned, and explored with the purpose of defining interesting research questions.
+
+What this first analysis aims to do is to find geographic and chronologic migration patterns.
+
+The data in question is the public data of the city of vienna covering migration flows from, to and within Vienna since 2007. The data was accessed from this webpage: <https://www.data.gv.at/katalog/dataset/844ab0bc-661f-4507-99c2-6f43d66fa5ad#additional-info>
+
+Below follows a description of the variables in the dataset
+
+-   NUTS: EU-data signiying Austria
+
+-   DISTRICT_CODE: 2nd and 3 letter denotes the district (bezirk)
+
+-   SUB_DISTRICT_CODE: district within the Bezirk (ZZ=99 bei fehlender Zählbezirkskennzeichnung)
+
+-   REF_YEAR: year the data was observed
+
+-   REF_DATE: date the data was observed
+
+-   SEX: denotes gender of migrants (1 = m, 2 = f)
+
+-   Geo2:(AUT = austria, FOR = foreign) - denotes the citizenship of the migrants
+
+-   NET = sum of migration, positive indicates more moved to Vienna than left
+
+-   EXT = denotes migration from/to abroad
+
+-   INT = denotes migration within Austria (Bundesländer)
+
+-   IN = into Vienna
+
+-   OUT = out of Vienna
+
+-   MOV = migration within Vienna (between subdistricts = Zählbezirk)
+
+-   LOCAL = migration within/between subdistricts
+
+# Data Import and preparation
+
+The CSV files contain an extra header, which manually has to be removed before import
+
+```{r data import}
+df = read_delim(
+  "data/vie-zbz-pop-sex-nat-geo2-mig-2007f.csv",
+  delim = ";",
+  escape_double = FALSE,
+  trim_ws = TRUE
+)
+
+print(nrow(df)) 
+print(ncol(df))
+print(head(df))
+```
+
+The data consists of 18564 datapoints with 18 variables. The raw data is disaggregated in the order of Year -\> Bezirk -\> Zählbezirk -\> Sex -\> Nationality. If analysing change
+
+To prepare the data for exploration, the columns "NUTS" and "REF_DATE" are removed since they are superfluous. The Column names are changed to lower case and renamed for better interpretability.
+
+The number of districs and subdistricts are shortened to only contain necessary information in the context of Vienna, the values of sex and nationality changed to be more easily interpretable.
+
+```{r data preparation}
+df = subset(df, select = -c(NUTS, REF_DATE))
+colnames(df) = c(
+  "bezirk",
+  "zählbezirk",
+  "year",
+  "sex",
+  'nationality',
+  'net',
+  'ext_net',
+  'ext_in',
+  'ext_out',
+  'int_net',
+  'int_in',
+  'int_out',
+  'local_net',
+  'local_in',
+  'local_out',
+  'local_internal'
+)
+
+#adjust datatypes
+df = df %>% mutate(
+  bezirk = as.character(bezirk),
+  zählbezirk = as.character(zählbezirk),
+  sex = as.character(sex)
+)
+
+#adjust values for interpretability
+df = df %>% mutate(
+  bezirk = substr(bezirk, 2, 3),
+  zählbezirk = substr(zählbezirk, 2, 5),
+  sex = case_when(sex == 1 ~ "male",
+                  sex == 2 ~ "female"),
+  nationality = case_when(nationality == "AUT" ~ "Austrian",
+                          nationality == "FOR" ~ "Foreign")
+)
+
+#setting categorical variable as factors
+df = df %>% mutate(
+  bezirk = as.factor(as.numeric(bezirk)),
+  zählbezirk = as.factor(as.numeric(zählbezirk)),
+  sex = as.factor(sex),
+  nationality = as.factor(nationality)
+)
+
+print(head(df))
+```
+
+Since different districts have different populations, this will affect the number of migrants, simply due to more people living in a district is associated with more people being able to decide to migrate. To be able to make comparisons between districts, population data is needed to turn the migration into a percentage of population. Population data for each year and District is therefore added using official data from the city of vienna:
+
+datalink: <https://www.data.gv.at/katalog/dataset/091a085f-2652-429f-8dde-c69199440ddf>
+
+The population data is only given on a District, which means changes is always relative to district total and not subdistrict total
+
+```{r population data}
+
+#reading data
+pop = read_delim(
+  "data/vie-bez-pop-sex-stk-1869f.csv",
+  delim = ";",
+  escape_double = FALSE,
+  trim_ws = TRUE
+)
+
+# preparing data for merge
+pop = pop %>% select(DISTRICT_CODE, REF_YEAR, POP_TOTAL)
+colnames(pop) = c("bezirk", "year", "bezirk_pop")
+pop$bezirk = as.factor(as.numeric(substr(as.character(pop$bezirk), 2, 3)))
+pop = pop %>% filter(year > 2006)
+
+#merging data on Bezirk and year
+df = df %>% inner_join(pop, by = c("bezirk" = "bezirk", "year" = "year"))
+
+#turning change into percent
+df = df %>% mutate(
+  net_p = net * 100 / bezirk_pop,
+  ext_net_p = ext_net * 100 / bezirk_pop,
+  ext_in_p = ext_in * 100 / bezirk_pop,
+  ext_out_p = ext_out * 100 / bezirk_pop,
+  int_net_p = int_net * 100 / bezirk_pop,
+  int_in_p = int_in * 100 / bezirk_pop,
+  int_out_p = int_out * 100 / bezirk_pop,
+  local_net_p = local_net * 100 / bezirk_pop,
+  local_in_p = local_in * 100 / bezirk_pop,
+  local_out_p = local_out * 100 / bezirk_pop,
+  local_internal_p = local_internal * 100 / bezirk_pop
+)
+
+print(head(df))
+
+```
+
+To be able to visualize the data using maps, geodata is needed, which is accessed from the city of vienna.
+
+District: <https://www.data.gv.at/katalog/dataset/2ee6b8bf-6292-413c-bb8b-bd22dbb2ad4b> Subdistrict: <https://www.data.gv.at/katalog/dataset/e4079286-310c-435a-af2d-64604ba9ade5#resources>
+
+```{r adding geodata}
+#read geo data
+geo_bezirk = st_read("data/BEZIRKSGRENZEOGDPolygon.shp")
+
+#prepare for merge
+geo_bezirk$BEZNR = as.factor(geo_bezirk$BEZNR)
+geo_bezirk = geo_bezirk %>% select(BEZNR, FLAECHE, geometry) %>% rename(bezirk = BEZNR,
+                                                                        bezirk_area = FLAECHE,
+                                                                        bezirk_geometry = geometry)
+#merge
+df = df %>% left_join(geo_bezirk, by = c("bezirk" = "bezirk"))
+
+
+#read geo_data
+geo_zählbezirk = st_read("data/ZAEHLBEZIRKOGDPolygon.shp")
+
+#prepare for merge
+geo_zählbezirk$ZBEZNR = geo_zählbezirk$BEZNR * 100 + geo_zählbezirk$ZBEZNR
+geo_zählbezirk$ZBEZNR = as.factor(geo_zählbezirk$ZBEZNR)
+geo_zählbezirk = geo_zählbezirk %>% select(ZBEZNR, FLAECHE, geometry) %>% rename(
+  zählbezirk = ZBEZNR,
+  zählbezirk_area = FLAECHE,
+  zählbezirk_geometry = geometry
+)
+
+#merge
+df = df %>% left_join(geo_zählbezirk, by = c("zählbezirk" = "zählbezirk"))
+head(df)
+
+```
+
+# Visualizations
+
+Having read the data and prepared it for analysis, it can be explored. Depending on which aspect should be studied, the data has to be aggregated differently.
+
+We start by exploring the data with boxplots
+
+## Boxplots
+
+```{r boxplots}
+
+#net migration per bezirk
+ggplot(data = df %>% group_by(year, bezirk) %>% summarise(net = sum(net)),
+  aes(y = net, x = bezirk, fill = bezirk)) +
+  geom_boxplot() + theme(legend.position  = "none") +
+  labs(y = "migration", title = "net migration by bezirk from 2007 to 2023")
+
+#net migration per bezirk percentage
+ggplot(data = df %>% group_by(year, bezirk) %>% summarise(net_p = sum(net_p)),
+  aes(y = net_p, x = bezirk, fill = bezirk)) +
+  geom_boxplot() + theme(legend.position  = "none") +
+  labs(y = "migration", title = "net migration by bezirk from 2007 to 2023 by percent change")
+
+#net migration per bezirk and nationality
+ggplot(data = df %>% group_by(year, bezirk, nationality) %>% summarise(net = sum(net)),
+  aes(y = net, x = bezirk, fill = nationality)) +
+  geom_boxplot() +
+  labs(y = "migration", title = "net migration by bezirk and nationality")
+
+#net migration per bezirk and nationality percentage
+ggplot(data = df %>% group_by(year, bezirk, nationality) %>% summarise(net_p = sum(net_p)),
+  aes(y = net_p, x = bezirk, fill = nationality)) +
+  geom_boxplot() +
+  labs(y = "migration", title = "net migration by bezirk and nationality")
+
+#net migration oer bezirk and sex
+ggplot(data = df %>% group_by(year, bezirk, sex) %>% summarise(net = sum(net)),
+  aes(y = net, x = bezirk, fill = sex)) +
+  geom_boxplot() +
+  labs(y = "migration", title = "net migration by bezirk and sex")
+
+```
+
+Viewing the boxplots, districs which have been primary targets of migration can be identified. Especially prominent with regard to pure number of persons are the 2nd and 10, with especially 10 showig an incredible range of its distributions. Other prominent districts which have received large amounts of migration, are the 3rd, 5th, 9th, 12th, 15th, 16th, and 20th. Across the board, all districts observe a median positive migration with the 23d being the only District with negative median migration.
+
+Looking at percentage change, a somewhat different picture is painted. The 2nd and 10th do not see an especially large migration, where the 10th district even being among the districts with the smallest migration. Instead, the 8th and 9th districts show the largest migration as percentage, with th 9th one year having a positive net migration equalling almost 10 percent of its population.
+
+Considering migration of Austrian versus Foreign, some patterns can be observed. The center districts 1 to 9 see positive net Austrian migration, but the outer districts 10 to 23 see a negative net Austrian migration.
+
+Further more, the net Austrian migration is substantially lower than that of foreign migration, and districts with large positive foreign migration generally see larger negative austrian migration. To explore this further, the correlation between Austrian and foreign migration could be studied.
+
+With regards to sex, there are generally no large discrepancies, except for the 9th and 10th districs, with the 10th districts seeing a much larger net migration of men compared to women and the 9th districts seeing a larger net migration of women compared to men.
+
+## scatterplots
+
+```{r correlation}
+#aggregate per nationnality
+df_nat = df %>% group_by(year, bezirk, nationality) %>% summarise(net_p = sum(net_p), net = sum(net))
+
+
+#pivot wide
+df_nat = df_nat %>% pivot_wider(names_from = nationality, values_from = c("net_p", "net"))
+
+#change tag to inner districs and outer district
+df_nat = df_nat %>% mutate(cent_out = case_when(as.numeric(bezirk) < 10 ~ "center",
+                                     as.numeric(bezirk) > 9 ~ "outer"))
+
+#scatterplot
+ggplot(data = df_nat, aes(y = net_Austrian, x = net_Foreign, color = cent_out)) + 
+  geom_point() + 
+  labs(y = "net Austrian migration",
+       x = "net Foreign migration",
+       title = "Net Austrian vs Foreign migration coloured by center and outer distircts")
+
+print(paste("net migration, pearsons r:", as.character(round(cor(df_nat$net_Austrian, df_nat$net_Foreign),3))))
+
+
+ggplot(data = df_nat, aes(y = net_p_Austrian, x = net_p_Foreign, color = cent_out)) + 
+  geom_point() + 
+  labs(y = "net Austrian migration",
+       x = "net Foreign migration",
+       title = "Net percentage Austrian vs Foreign migration coloured by center and outer distircts")
+
+  
+print(paste("net percentage migration, pearsons r:", as.character(round(cor(df_nat$net_p_Austrian, df_nat$net_p_Foreign),3))))
+
+
+```
+
+Looking at net migration, there is a small negative correlation between Austrian and foreign migration. When looking at migration as a percentage, then the relationship is positive, foreign migration as a percentage is associated with Austrian migration. It can also clearly be observed that the central districs and outer distric form two separate clusters. Both center and outer districts have positive foreign migration, but the Austrians moving to Vienna seem to target the inner Districs, while the Austrians leaving Vienna are leaving the outer districts.
+
+## Time series
+
+By plotting time vs migration, general trends over time can be observed.
+
+```{r time series sec, year, nationality}
+
+#total per year
+ggplot(data = df %>% group_by(year) %>% summarise(net = sum(net)),
+       aes(y = net, x = year)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous() +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme(legend.position  = "none") +
+  labs(y = "migration", title = "yearly net migration Vienna")
+
+# aggregated by sex
+ggplot(data = df %>% group_by(year, sex) %>% summarise(net = sum(net)),
+  aes(
+    y = net,
+    x = year,
+    fill = sex,
+    color = sex)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous() +
+  scale_y_continuous(limits = c(0, NA)) +
+  theme() +
+  labs(y = "migration", title = "yearly net migration Vienna by sex")
+
+# nationality
+ggplot(
+  data = df %>% group_by(year, nationality) %>% summarise(net = sum(net)),
+  map = aes(
+    y = net,
+    x = year,
+    fill = nationality,
+    color = nationality
+  )
+) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous() +
+  theme() +
+  labs(y = "migration", title = "yearly net migration Vienna by nationality")
+
+```
+
+Looking at total migration, Vienna has seen positive net migration each year, with a steady inrcraese from 2008 until the peak of 2015, which is when the european refugee crisis took place in the wake of the Syrian civil war. After that, net migration decreased and remained fairly stable between 2018 and 2021, after which a steap increase was seen for 2022, which coincides with the war in Ukraine, possible explaining this sudden peak.
+
+Considering nationality, Vienna has had a net negative migration of Austrian nationals, which however was increasing from 2007 until 2012 almost reaching net zero, but since then has generally been falling.
+
+Migration by sex is fairly equal between men and women, with an increase in men compared to women in the years 2013 and 2016, which the largest difference in 2015.
+
+Furthermore, the different types of migrations, external (with outside of Austria) and internal (with other regions of Austria) can be compared
+
+```{r time series, types of migration}
+ggplot(
+  data = df %>% group_by(year) %>% summarise(ext_net = sum(ext_in), int_net = sum(int_net)) %>% pivot_longer(
+    cols = c(ext_net, int_net),
+    names_to = "type",
+    values_to = "net"),
+  aes(
+    y = net,
+    x = year,
+    fill = type,
+    color = type)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous() +
+  scale_y_continuous() +
+  theme() +
+  labs(y = "migration", title = "yearly net migration Vienna External vs Internal migration")
+
+
+ggplot(data = df %>% group_by(year) %>%
+    summarise(
+      ext_out = sum(ext_out),
+      int_out = sum(int_out),
+      ext_in = sum(ext_in),
+      int_in = sum(int_in)) %>%
+    pivot_longer(
+      cols = c(ext_out, int_out, ext_in, int_in),
+      names_to = "type",
+      values_to = "net"),
+    aes(
+    y = net,
+    x = year,
+    fill = type,
+    color = type)) +
+  geom_line() +
+  geom_point() +
+  scale_x_continuous() +
+  scale_y_continuous() +
+  theme() +
+  labs(y = "migration", title = "yearly net migration Vienna External vs Internal migration")
+
+```
+
+It can be observed that the net migration from outside Austria follows the trend of migration of foreign nationals very closely, and the within Austria migration that of Austrian nationals. There is however and interesting trend break, with the internal migration increasing from 2018, whereas the net migration of Austrian nationals decreases. This means that there is a postive trend of foreign nationals already living in Austria moving from other parts to Vienna from 2018 and onwards.
+
+# maps
+
+Finally, we consider looking at migration from a geographical point of View using maps
+
+## data preparation
+
+```{r prep geo}
+
+bezirk_year_nat = df %>% group_by(year, bezirk, nationality) %>% summarize(
+  net = sum(net),
+  ext_net = sum(ext_net),
+  int_net = sum(int_net),
+  local_net = sum(local_net),
+  local_internal = sum(local_internal),
+  net_p = sum(net_p),
+  ext_net_p = sum(ext_net_p),
+  int_net_p = sum(int_net_p),
+  local_net_p = sum(local_net_p),
+  local_internal_p = sum(local_internal_p)
+)
+head(bezirk_year_nat)
+
+df_map = bezirk_year_nat %>% group_by(bezirk, nationality) %>% summarize(
+  net = mean(net),
+  ext_net = mean(ext_net),
+  int_net = mean(int_net),
+  local_net = mean(local_net),
+  local_internal = mean(local_internal),
+  net_p = mean(net_p),
+  ext_net_p = mean(ext_net_p),
+  int_net_p = mean(int_net_p),
+  local_net_p = mean(local_net_p),
+  local_internal_p = mean(local_internal_p)
+)
+
+df_map = df_map %>% left_join(geo_bezirk, by = c("bezirk" = "bezirk"))
+df_map_aut = df_map %>% filter(nationality == "Austrian") %>% select(!nationality)
+df_map_for = df_map %>% filter(nationality == "Foreign") %>% select(!nationality)
+
+df_map = st_as_sf(df_map)
+df_map_aut = st_as_sf(df_map_aut)
+df_map_for = st_as_sf(df_map_for)
+
+```
+
+## net migration
+
+```{r map total net}
+
+ggplot(df_map) +
+  geom_sf(aes(fill = net), color = "black") +  #
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "blue",
+    midpoint = 0,
+    name = "Net Migration"
+  ) +  #
+  labs(title = "Average Yearly Net Migration by Bezirk from 2007 to 2023") +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+ggplot(df_map_aut) +
+  geom_sf(aes(fill = net), color = "black") +  # Fill polygons by 'net' and outline with black
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "blue",
+    midpoint = 0,
+    name = "Net Migration"
+  ) +  # Color gradient for negative/positive values
+  labs(title = "Average Yearly Net Austrian Migration by Bezirk from 2007 to 2023") +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+ggplot(df_map_for) +
+  geom_sf(aes(fill = net), color = "black") +  # Fill polygons by 'net' and outline with black
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "blue",
+    midpoint = 0,
+    name = "Net Migration"
+  ) +  # Color gradient for negative/positive values
+  labs(title = "Average Yearly Net Foreign Migration by Bezirk from 2007 to 2023") +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+
+```
+
+```{r total mig percent}
+
+ggplot(df_map) +
+  geom_sf(aes(fill = net_p), color = "black") +  #
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "blue",
+    midpoint = 0,
+    name = "Net Migration"
+  ) +  #
+  labs(title = "Average Yearly Net Migration as percent of population") +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+ggplot(df_map_aut) +
+  geom_sf(aes(fill = net_p), color = "black") +  # Fill polygons by 'net' and outline with black
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "blue",
+    midpoint = 0,
+    name = "Net Migration"
+  ) +  # Color gradient for negative/positive values
+  labs(title = "Average Yearly Net Austrian Migration as percent of population") +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+ggplot(df_map_for) +
+  geom_sf(aes(fill = net_p), color = "black") +  # Fill polygons by 'net' and outline with black
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "blue",
+    midpoint = 0,
+    name = "Net Migration"
+  ) +  # Color gradient for negative/positive values
+  labs(title = "Average Yearly Net Foreign Migration as percent of population") +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank(),
+  )
+
+```
+
+Austrians leaving Vienna are leaving the outer Bezirks, and Austrians moving in are targeting the central Bezirks.
+
+Central Districs see the most migration as percent of population, while outer Districs see larger amounts of total migrants.
+
+## local migration - within Vienna
+
+```{r map local net}
+ggplot(df_map) +
+  geom_sf(aes(fill = local_net), color = "black") +  # Fill polygons by 'net' and outline with black
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "blue",
+    midpoint = 0,
+    name = "Net Migration"
+  ) +  # Color gradient for negative/positive values
+  labs(title = "Average Yearly Net Between Bezirk Migration from 2007 to 2023") +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+ggplot(df_map_aut) +
+  geom_sf(aes(fill = local_net), color = "black") +  # Fill polygons by 'net' and outline with black
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "blue",
+    midpoint = 0,
+    name = "Net Migration"
+  ) +  # Color gradient for negative/positive values
+  labs(title = "Average Yearly Austrian Net Between Bezirk Migration in Vienna from 2007 to 2023") +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+ggplot(df_map_for) +
+  geom_sf(aes(fill = local_net), color = "black") +  # Fill polygons by 'net' and outline with black
+  scale_fill_gradient2(
+    low = "red",
+    mid = "white",
+    high = "blue",
+    midpoint = 0,
+    name = "Net Migration"
+  ) +  # Color gradient for negative/positive values
+  labs(title = "Average Yearly Foreign Between Bezirk Migration in Vienna from 2007 to 2023") +
+  theme_minimal() +
+  theme(
+    axis.text = element_blank(),
+    axis.ticks = element_blank(),
+    panel.grid = element_blank()
+  )
+
+```
+
+```{r map local mig percent}
+ggplot(df_map) +
+  geom_sf(aes(fill = local_net_p), color = "black") + 
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0, 
+                       name = "Percent Net Migration") +  
+  labs(title = "Average yearly percent between Bezirk net migration 2007 - 2023") +
+  theme_minimal() + 
+  theme(axis.text = element_blank(),  
+        axis.ticks = element_blank(), 
+        panel.grid = element_blank())
+
+
+ggplot(df_map_aut) +
+  geom_sf(aes(fill = local_net_p), color = "black") + 
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0, 
+                       name = "Percent Net Migration") +  
+  labs(title = "Average yearly Austrian percent between Bezirk net migration 2007 - 2023") +
+  theme_minimal() + 
+  theme(axis.text = element_blank(),  
+        axis.ticks = element_blank(), 
+        panel.grid = element_blank())
+
+
+ggplot(df_map_for) +
+  geom_sf(aes(fill = local_net_p), color = "black") + 
+  scale_fill_gradient2(low = "red", mid = "white", high = "blue", midpoint = 0, 
+                       name = "Percent Net Migration") +  
+  labs(title = "Average yearly Foreign percent between Bezirk net migration 2007 - 2023") +
+  theme_minimal() + 
+  theme(axis.text = element_blank(),  
+        axis.ticks = element_blank(), 
+        panel.grid = element_blank())
+```
+
+It seems that migration within Vienna sees people leaving the central districs and moving towards the outer districts, A trend which is particularly strong for Viennese people of Austrian nationality.
+
+# Conclusion
+
+We observe a trend of Austrians leaving Vienna and Foreign citizens moving to Vienna from outside of Austria. In recent years, there has also been an increase in Foreign citizens moving to Vienna from within Austria.
+
+Migration with the outside is mostly targeting the inner districs, while migration within Vienna sees people leaving the inner districts for the outer districts. There is sort of a triangulation going on. People are moving from outside of Vienna to the inner city, then from the inner city to the Outskrits of the city, and then from the outskirts they are leaving Vienna.
+
+From here, two things are interesting to understand better:
+
+1.  To what extent is this migration trend driven by housing prices?
+
+2.  What impact did this migration trend have on the national election result in 2024, which saw the anti-migration party FPÖ become the largest party?
